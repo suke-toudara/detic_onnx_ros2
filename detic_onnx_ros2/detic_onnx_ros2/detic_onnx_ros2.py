@@ -36,7 +36,7 @@ class DeticNode(Node):
         )
         self.session = onnxruntime.InferenceSession(
             self.weight_and_model,
-            providers=["CPUExecutionProvider"],  # "CUDAExecutionProvider"],
+            providers=["CUDAExecutionProvider"],#"CPUExecutionProvider"],  # "CUDAExecutionProvider"],
         )
         self.image_publisher = self.create_publisher(
             Image, self.get_name() + "/detic_result/image", 10
@@ -83,7 +83,7 @@ class DeticNode(Node):
         return meta
 
     def draw_predictions(
-        self, image: np.ndarray, detection_results: Any, vocabulary: str
+        self, image: np.ndarray, detection_results: Any, vocabulary: str,origin_scal: tuple
     ) -> Tuple[np.ndarray, List[Segmentation]]:
         segmentations: List[Segmentation] = []
         width = image.shape[1]
@@ -106,8 +106,10 @@ class DeticNode(Node):
 
         num_instances = len(boxes)
 
+        #カラーラベル
         np.random.seed()
         assigned_colors = [random_color(maximum=255) for _ in range(num_instances)]
+        
 
         areas = np.prod(boxes[:, 2:] - boxes[:, :2], axis=1)
         if areas is not None:
@@ -125,13 +127,14 @@ class DeticNode(Node):
             color = assigned_colors[i]
             color = (int(color[0]), int(color[1]), int(color[2]))
             image_b = image.copy()
-
+            
             # draw box
-            x0, y0, x1, y1 = boxes[i]
+            _x0, _y0, _x1, _y1 = boxes[i]
+            x0, y0, x1, y1 = int(_x0*origin_scal[1]), int(_y0*origin_scal[0]), int(_x1*origin_scal[1]), int(_y1*origin_scal[0])
             cv2.rectangle(
                 image_b,
-                (x0, y0),
-                (x1, y1),
+                (_x0, _y0),
+                (_x1, _y1),
                 color=color,
                 thickness=default_font_size // 4,
             )
@@ -149,14 +152,15 @@ class DeticNode(Node):
                 points = np.array(points).reshape((1, -1, 2)).astype(np.int32)
                 for i in range(points[0].shape[0]):
                     point_on_image = PointOnImage()
-                    point_on_image.x = int(points[0][i][0])
-                    point_on_image.y = int(points[0][i][1])
+                    point_on_image.x = int(points[0][i][0]*origin_scal[1])
+                    point_on_image.y = int(points[0][i][1]*origin_scal[0])
                     polygon.points.append(point_on_image)
+                    
                 cv2.fillPoly(image_b, pts=[points], color=color)
                 segmentation.polygons.append(polygon)
             segmentations.append(segmentation)
-
             image = cv2.addWeighted(image, 0.5, image_b, 0.5, 0)
+            
 
         for i in range(num_instances):
             color = assigned_colors[i]
@@ -166,6 +170,7 @@ class DeticNode(Node):
             color_text = (int(color_text[0]), int(color_text[1]), int(color_text[2]))
 
             x0, y0, x1, y1 = boxes[i]
+            x0, y0, x1, y1 = int(x0*origin_scal[1]), int(y0*origin_scal[0]), int(x1*origin_scal[1]), int(y1*origin_scal[0])
 
             SMALL_OBJECT_AREA_THRESH = 1000
             instance_area = (y1 - y0) * (x1 - x0)
@@ -200,6 +205,7 @@ class DeticNode(Node):
                 thickness=font_thickness,
                 lineType=cv2.LINE_AA,
             )
+            image =  cv2.resize(image, (int(width*origin_scal[1]),int(height*origin_scal[0])))
 
         return image, segmentations
 
@@ -224,6 +230,7 @@ class DeticNode(Node):
         # would be to first +0.5 and then dilate the returned polygon by 0.5.
         return [x + 0.5 for x in res if len(x) >= 6]
 
+    # 事前準備
     def preprocess(self, image: np.ndarray) -> np.ndarray:
         height, width, _ = image.shape
         image = image[:, :, ::-1]  # BGR -> RGB
@@ -248,20 +255,25 @@ class DeticNode(Node):
         image = image.astype(np.float32)
         return image
 
+
     def image_callback(self, msg):
+        
         input_image = self.bridge.imgmsg_to_cv2(msg)
-
         vocabulary = "lvis"
-
         class_names = (
             self.get_lvis_meta_v1()
             if vocabulary == "lvis"
             else self.get_in21k_meta_v1()
         )["thing_classes"]
 
+        origin_height = input_image.shape[0]
+        origin_width = input_image.shape[1]
         image = self.preprocess(image=input_image)
         input_height = image.shape[2]
         input_width = image.shape[3]
+        
+        origin_scal = ((origin_height/float(input_height)),(origin_width/float(input_width)))
+
         inference_start_time = time.perf_counter()
         boxes, scores, classes, masks = self.session.run(
             None,
@@ -277,11 +289,10 @@ class DeticNode(Node):
             + " [sec]"
         )
         draw_mask = masks
-        masks = masks.astype(np.uint8)
+        masks = masks.astype(np.uint8) 
         draw_classes = classes
-        draw_boxes = boxes
-        draw_scores = scores
-
+        draw_boxes = boxes 
+        draw_scores = scores 
         labels = [class_names[i] for i in classes]
         areas = np.prod(boxes[:, 2:] - boxes[:, :2], axis=1)
         if areas is not None:
@@ -290,6 +301,8 @@ class DeticNode(Node):
             boxes = boxes[sorted_idxs]
             labels = [labels[k] for k in sorted_idxs]
             masks = [masks[idx] for idx in sorted_idxs]
+
+            
         scores = scores.astype(np.float32)
         detection_results = {
             "boxes": draw_boxes,
@@ -297,20 +310,24 @@ class DeticNode(Node):
             "classes": draw_classes,
             "masks": draw_mask,
         }
+
         visualization, segmentations = self.draw_predictions(
             cv2.cvtColor(
                 cv2.resize(input_image, (input_width, input_height)), cv2.COLOR_BGR2RGB
             ),
             detection_results,
             "lvis",
+            origin_scal,
         )
+
         segmentation_info = SegmentationInfo()
         segmentation_info.header = msg.header
         segmentation_info.segmentations = segmentations
+        self.get_logger().info(f"{len(segmentation_info.segmentations[0].polygons)}")
+        self.get_logger().info("--------------------------------------------------")
         self.segmentation_publisher.publish(segmentation_info)
         self.image_publisher.publish(self.bridge.cv2_to_imgmsg(visualization, "bgr8"))
-
-
+        
 def main(args=None):
     rclpy.init(args=args)
     detic_node = DeticNode()
